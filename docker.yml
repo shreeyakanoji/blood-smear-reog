@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: smear
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: smear
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+  api:
+    build: .
+    restart: on-failure
+    depends_on: [db]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://smear:change-me@db:5432/smear
+      SMEAR_API_KEYS: "alice:change-this-key"
+    volumes: ["./models:/app/models:ro", "scans:/data/scans"]
+    ports: ["8000:8000"]
+volumes:
+  pgdata: {}
+  scans: {}
