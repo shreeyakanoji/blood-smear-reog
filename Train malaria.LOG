@@ -1,0 +1,58 @@
+rgb    val macro-F1 0.792  {'n_estimators': 300, 'max_depth': None}  (train cells 553, val cells 165)
+odrgb  val macro-F1 0.867  {'n_estimators': 300, 'max_depth': 8}  (train cells 553, val cells 165)
+unmix  val macro-F1 0.847  {'n_estimators': 100, 'max_depth': 8}  (train cells 553, val cells 165)
+gate   val macro-F1 1.000  {'n_estimators': 100, 'max_depth': None}  (train cells 710, 157 white)
+
+TEST (zero-shot on every non-baseline condition)
+                  condition method  n_fields  accuracy  macro_f1  f1_lo  f1_hi  sensitivity  specificity   auc  e2e_accuracy
+                   Baseline    rgb        30     0.814     0.804  0.742  0.858        0.878        0.782 0.936           NaN
+                   Baseline  odrgb        30     0.899     0.893  0.866  0.919        0.993        0.851 0.962           NaN
+                   Baseline  unmix        30     0.891     0.885  0.859  0.911        0.978        0.847 0.957         0.891
+                   Dim -40%    rgb        30     0.727     0.631  0.544  0.705        0.324        0.931 0.767           NaN
+                   Dim -40%  odrgb        30     0.894     0.888  0.861  0.915        0.993        0.844 0.965           NaN
+                   Dim -40%  unmix        30     0.889     0.883  0.854  0.911        0.986        0.840 0.961         0.889
+                Bright +40%    rgb        30     0.664     0.399  0.383  0.413        0.000        1.000 0.793           NaN
+                Bright +40%  odrgb        30     0.899     0.893  0.866  0.918        0.993        0.851 0.957           NaN
+                Bright +40%  unmix        30     0.884     0.877  0.851  0.904        0.971        0.840 0.955         0.884
+ Camera B (IR-cut, noisier)    rgb        30     0.667     0.407  0.386  0.433        0.007        1.000 0.841           NaN
+ Camera B (IR-cut, noisier)  odrgb        30     0.894     0.888  0.861  0.915        0.993        0.844 0.969           NaN
+ Camera B (IR-cut, noisier)  unmix        30     0.874     0.866  0.837  0.894        0.928        0.847 0.957         0.874
+           Aged stain batch    rgb        30     0.738     0.632  0.575  0.689        0.299        0.960 0.830           NaN
+           Aged stain batch  odrgb        30     0.861     0.830  0.769  0.883        0.650        0.967 0.953           NaN
+           Aged stain batch  unmix        30     0.878     0.872  0.842  0.903        0.993        0.820 0.956         0.878
+       Rig B (cross-device)    rgb        29     0.663     0.399  0.381  0.413        0.000        1.000 0.830           NaN
+       Rig B (cross-device)  odrgb        29     0.883     0.860  0.790  0.917        0.711        0.970 0.974           NaN
+       Rig B (cross-device)  unmix        29     0.805     0.789  0.719  0.851        0.778        0.820 0.918         0.805
+          Low light + noisy    rgb        30     0.739     0.649  0.570  0.713        0.345        0.938 0.759           NaN
+          Low light + noisy  odrgb        30     0.386     0.332  0.255  0.425        1.000        0.076 0.920           NaN
+          Low light + noisy  unmix        30     0.592     0.591  0.518  0.652        0.842        0.465 0.784         0.592
+Worst case (aged+rig B+dim)    rgb        30     0.663     0.399  0.382  0.413        0.000        1.000 0.533           NaN
+Worst case (aged+rig B+dim)  odrgb        30     0.680     0.451  0.399  0.521        0.050        1.000 0.569           NaN
+Worst case (aged+rig B+dim)  unmix        30     0.711     0.649  0.590  0.710        0.432        0.853 0.770         0.711
+
+PAIRED: unmixed minus flat-fielded RGB (macro-F1). CI excluding 0 = a real difference
+                  condition  unmix_minus_odrgb  ci_lo  ci_hi
+                   Baseline             -0.008 -0.029  0.010
+                   Dim -40%             -0.005 -0.036  0.018
+                Bright +40%             -0.015 -0.039  0.002
+ Camera B (IR-cut, noisier)             -0.022 -0.056  0.008
+           Aged stain batch              0.042 -0.018  0.108
+       Rig B (cross-device)             -0.071 -0.126 -0.014
+          Low light + noisy              0.259  0.156  0.357
+Worst case (aged+rig B+dim)              0.199  0.108  0.273
+
+GATE (red vs white cell routing)
+                  condition  gate_accuracy  acc_lo  acc_hi  wbc_recall  rbc_recall  n_cells
+                   Baseline            1.0     1.0     1.0         1.0         1.0      530
+                   Dim -40%            1.0     1.0     1.0         1.0         1.0      531
+                Bright +40%            1.0     1.0     1.0         1.0         1.0      530
+ Camera B (IR-cut, noisier)            1.0     1.0     1.0         1.0         1.0      531
+           Aged stain batch            1.0     1.0     1.0         1.0         1.0      523
+       Rig B (cross-device)            1.0     1.0     1.0         1.0         1.0      518
+          Low light + noisy            1.0     1.0     1.0         1.0         1.0      531
+Worst case (aged+rig B+dim)            1.0     1.0     1.0         1.0         1.0      530
+
+PHYSICS CHECKS (untrained stages)
+{'registration_rmse_px': 0.46734447315788535, 'concentration_pearson_r': {'eosin': 0.9863682552292655, 'azure / methylene blue': 0.9822094261793655, 'hemoglobin': 0.9828965404984757, 'scatter': 0.33487965652255275}, 'defect_recall': 0.9945121951219512, 'defect_false_positive_rate': 0.016471500103401527, 'threshold_k': 5.0}
+
+Saved model: malaria-20260928-185522
