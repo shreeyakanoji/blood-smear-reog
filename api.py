@@ -21,7 +21,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _keys():
-   
+    # SMEAR_API_KEYS="alice:key1,bob:key2"  
     raw = os.getenv("SMEAR_API_KEYS", "dev:dev-key")
     return {k: u for u, k in (p.split(":", 1) for p in raw.split(",") if ":" in p)}
 
@@ -81,13 +81,18 @@ async def create_scan(file: UploadFile = File(...), task: str = Form("malaria"),
     med = np.median(P["res"]); mad = 1.4826 * np.median(np.abs(P["res"] - med))
     flag = P["res"] > med + 5 * mad                      # residual anomaly map (self-referenced)
     ch = sc.channels(P, wl, "unmix")
+    fam_wbc = meta["cell_family"] == "wbc"
     out = []
     for c in cells:
         m = lab == c["id"]
-        p = float(mdl["unmix"].predict_proba(sc.cell_feats(ch, m)[None])[0, 1])
+        f = sc.cell_feats(ch, m)[None]
+        is_wbc = int(mdl["gate"].predict(f)[0]) == 1                  # gate: red vs white cell
+        in_scope = is_wbc == fam_wbc                                  # only classify cells of this task's family
+        p = float(mdl["unmix"].predict_proba(f)[0, 1]) if in_scope else None
         ff = float(flag[m].mean())
         out.append(dict(cell=int(c["id"]), x=round(float(c["x"]), 1), y=round(float(c["y"]), 1),
-                        p_positive=round(p, 4), label=meta["classes"][int(p >= .5)],
+                        cell_type="wbc" if is_wbc else "rbc", in_scope=bool(in_scope), p_positive=None if p is None else round(p, 4),
+                        label=None if p is None else meta["classes"][int(p >= .5)],
                         flagged_fraction=round(ff, 4), needs_review=ff > 0.2))
 
     sha = hashlib.sha256(raw).hexdigest()
