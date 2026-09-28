@@ -1,0 +1,13 @@
+streamlit>=1.35
+numpy
+scipy
+scikit-image
+scikit-learn
+pandas
+matplotlib
+pillow
+torch          # scratch CNN + adapted ResNet18 (Feature 9)
+torchvision
+pyserial       # Arduino LED control
+opencv-python  # USB camera capture
+# picamera2    # Raspberry Pi camera (install via apt on Raspberry Pi OS)
