@@ -19,9 +19,32 @@ METHOD_NAMES = {"rgb": "Raw RGB (naive)", "odrgb": "Flat-fielded RGB (OD)", "unm
 
 
 TASKS = {
-    "malaria": dict(classes=["uninfected", "infected"], types=("rbc", "rbc_inf")),
-    "wbc_diff": dict(classes=["lymphocyte", "neutrophil"], types=("lymph", "neut")),
+    "malaria": dict(classes=["uninfected", "infected"], types=("rbc", "rbc_inf"), family="rbc"),
+    "wbc_diff": dict(classes=["lymphocyte", "neutrophil"], types=("lymph", "neut"), family="wbc"),
 }
+WBC_TYPES = ("lymph", "neut", "eos", "blast")
+
+
+def family_of(ctype):
+    """Cell family used by the gate classifier that routes each cell to the right task."""
+    return "wbc" if ctype in WBC_TYPES else "rbc"
+
+
+# Assumptions behind the realistic ("hard") simulator. They are chosen from physical plausibility, NOT tuned
+# to any method's score, and they are recorded in every saved model so results can be interpreted honestly.
+HARD = dict(
+    shift_nm=(6., -5., 3.),      # real stain lot's absorption peaks (eosin, azure, Hb) differ from the literature shapes
+    width=1.08,                  # ...and are 8% broader
+    jitter_nm=1.5,               # extra slide-to-slide spectral jitter (not captured by calibration)
+    stray=0.015,                 # 1.5% stray light -> measured OD no longer exactly linear (Beer-Lambert violation)
+    blur_px=(0.3, 1.3),          # defocus blur per slide, sigma in pixels
+    chroma=0.25,                 # extra blur away from 530 nm (chromatic aberration)
+    stain_scale=(0.65, 1.35),    # slide-to-slide staining intensity
+    parasite_amp=(0.15, 1.0),    # faint early-stage parasites up to bright late-stage ones
+    parasite_rad=(1.6, 2.8),     # parasite size, px
+    platelet_prob=0.15,          # uninfected RBCs carrying a platelet/precipitate that mimics a parasite
+    debris_max=5,                # azure-stained debris spots per field
+)
 
 
 #physics 
@@ -29,13 +52,15 @@ def _g(wl, mu, s, a):
     return a * np.exp(-0.5 * ((np.asarray(wl, float) - mu) / s) ** 2)
 
 
-def stain_matrix(wl, batch="fresh"):
-    """Absorption spectra M (rows = wavelengths, cols = STAINS). Synthetic, literature-like shapes."""
+def stain_matrix(wl, batch="fresh", shift=(0., 0., 0.), width=1.0):
+    """Absorption spectra M (rows = wavelengths, cols = STAINS). Synthetic, literature-like shapes.
+    shift = peak shifts in nm (eosin, azure, Hb); width = width multiplier. Defaults = the literature shapes."""
     wl = np.asarray(wl, float)
     e_mu, a_mu = (525, 645) if batch == "fresh" else (515, 630)
-    eos = _g(wl, e_mu, 28, 1.0) + _g(wl, 490, 20, 0.3)
-    azu = _g(wl, a_mu, 38, 1.0) + _g(wl, 595, 28, 0.55)
-    hem = _g(wl, 415, 22, 1.6) + _g(wl, 542, 17, 0.9) + _g(wl, 577, 14, 0.85) + _g(wl, 450, 30, 0.3)
+    se, sa, sh = shift; w = width
+    eos = _g(wl, e_mu + se, 28 * w, 1.0) + _g(wl, 490 + se, 20 * w, 0.3)
+    azu = _g(wl, a_mu + sa, 38 * w, 1.0) + _g(wl, 595 + sa, 28 * w, 0.55)
+    hem = _g(wl, 415 + sh, 22 * w, 1.6) + _g(wl, 542 + sh, 17 * w, 0.9) + _g(wl, 577 + sh, 14 * w, 0.85) + _g(wl, 450 + sh, 30 * w, 0.3)
     sca = 0.175 * (550 / wl) ** 1.5
     return np.stack([eos, azu, hem, sca], 1)
 
@@ -50,6 +75,7 @@ class Cond(NamedTuple):
     batch: str = "fresh"    # fresh / aged stain
     rig: str = "A"          # B = LED peak shifts + brightness spread
     noise: float = 1.0
+    hard: int = 1           # 1 = realistic simulator (spectral mismatch, stray light, blur, confounders); 0 = idealised
 
 
 RIG_OFF = {"A": {}, "B": {450: 7, 530: -9, 590: 8, 630: 6, 700: -8, 850: 12, 940: -14}}
@@ -90,9 +116,10 @@ def _case_plan(case, rng, n_rbc):
     return wbc + rb
 
 
-def make_field(seed, size=160, n_rbc=14, n_wbc=4, defects=False, case=None):
+def make_field(seed, size=160, n_rbc=14, n_wbc=4, defects=False, case=None, hard=True):
     """Synthetic smear. case=None keeps the legacy training-set generator; case in CASES builds a demo smear."""
     rng = np.random.default_rng(seed)
+    hardm = bool(hard) and case is None
     if case:
         size, n_rbc = max(size, 240), 50
     H = W = size
@@ -135,8 +162,16 @@ def make_field(seed, size=160, n_rbc=14, n_wbc=4, defects=False, case=None):
             if ct == "rbc_inf":
                 a, o = rng.uniform(0, 2 * np.pi), rng.uniform(.15, .6) * r
                 dd = np.hypot(xx - (x + o * np.cos(a)), yy - (y + o * np.sin(a)))
-                C[1] += rng.uniform(.6, 1.0) * np.exp(-(dd / 2.3) ** 2) * m
+                amp = rng.uniform(*HARD["parasite_amp"]) if hardm else rng.uniform(.6, 1.0)
+                pr = rng.uniform(*HARD["parasite_rad"]) if hardm else 2.3
+                C[1] += amp * np.exp(-(dd / pr) ** 2) * m
                 C[0][m] += 0.05
+            elif hardm and rng.random() < HARD["platelet_prob"]:
+                # hard negative: a platelet / precipitate lying on an UNinfected cell looks like a parasite
+                a, o = rng.uniform(0, 2 * np.pi), rng.uniform(.1, .9) * r
+                dd = np.hypot(xx - (x + o * np.cos(a)), yy - (y + o * np.sin(a)))
+                C[1] += rng.uniform(.4, .9) * np.exp(-(dd / rng.uniform(1.5, 2.6)) ** 2)   # not confined to the cell
+                C[3] += 0.05 * np.exp(-(dd / 2.5) ** 2)
         elif ct == "sickle":
             C[2][m] += 0.62; C[0][m] += 0.32
         elif ct == "target":
@@ -146,12 +181,15 @@ def make_field(seed, size=160, n_rbc=14, n_wbc=4, defects=False, case=None):
             prof = 0.12 + 0.88 * (d / r) ** 4
             C[2][m] += 0.5 * prof[m]; C[0][m] += 0.25 * prof[m]
         elif ct == "lymph":
-            n = d <= 0.75 * r; C[1][n] += 1.0; C[0][m & ~n] += 0.10
+            n = d <= (rng.uniform(.6, .85) if hardm else .75) * r
+            C[1][n] += rng.uniform(.7, 1.0) if hardm else 1.0; C[0][m & ~n] += rng.uniform(.04, .22) if hardm else 0.10
         elif ct == "neut":
-            C[0][m] += 0.28 + 0.1 * rng.random((H, W))[m]
-            for j in range(3):
-                a = 2 * np.pi * j / 3 + rng.uniform(0, 1)
-                C[1][np.hypot(xx - (x + .38 * r * np.cos(a)), yy - (y + .38 * r * np.sin(a))) <= .33 * r] += 0.85
+            C[0][m] += (rng.uniform(.10, .36) if hardm else 0.28) + 0.1 * rng.random((H, W))[m]
+            nl = int(rng.integers(2, 5)) if hardm else 3
+            for j in range(nl):
+                a = 2 * np.pi * j / nl + rng.uniform(0, 1)
+                lr = .33 * r * (rng.uniform(.9, 1.4) if hardm else 1.0)
+                C[1][np.hypot(xx - (x + .38 * r * np.cos(a)), yy - (y + .38 * r * np.sin(a))) <= lr] += (rng.uniform(.5, 1.0) if hardm else 0.85)
         elif ct == "eos":
             C[0][m] += 0.85
             for j in range(2):
@@ -160,6 +198,11 @@ def make_field(seed, size=160, n_rbc=14, n_wbc=4, defects=False, case=None):
         elif ct == "blast":
             n = d <= 0.85 * r; C[1][n] += 0.9; C[1][m & ~n] += 0.25
         cells.append(dict(id=idx, x=x, y=y, r=r, ctype=ct))
+    if hardm:
+        C[0] *= rng.uniform(*HARD["stain_scale"]); C[1] *= rng.uniform(*HARD["stain_scale"])   # slide-level staining variation
+        for _ in range(int(rng.integers(0, HARD["debris_max"] + 1))):                            # azure debris / precipitate
+            dx, dy = rng.uniform(5, W - 5), rng.uniform(5, H - 5)
+            C[1] += rng.uniform(.3, .9) * np.exp(-(np.hypot(xx - dx, yy - dy) / rng.uniform(1.0, 2.2)) ** 2)
     C = ndi.gaussian_filter(C, (0, .8, .8))
     D = None; dmask = np.zeros((H, W), bool)
     if defects:
@@ -184,6 +227,15 @@ def render_rgb(field, scale=1.0, seed=0, srgb=True, batch="fresh"):
     return (img * 255).astype(np.uint8)
 
 
+def true_matrix(wl_act, cond, rng=None):
+    """Absorption spectra actually present on the slide. In hard mode the real stain lot differs from the
+    literature shapes the pipeline assumes (so unmixing with the literature M is genuinely wrong)."""
+    if not cond.hard:
+        return stain_matrix(wl_act, cond.batch)
+    j = rng.normal(0, HARD["jitter_nm"], 3) if rng is not None else np.zeros(3)
+    return stain_matrix(wl_act, cond.batch, shift=tuple(np.array(HARD["shift_nm"]) + j), width=HARD["width"])
+
+
 def illum(wl_nom, cond):
     wl_nom = np.asarray(wl_nom, float)
     off = np.array([RIG_OFF[cond.rig].get(int(w), 0) for w in wl_nom])
@@ -203,12 +255,17 @@ def acquire(field, wl_nom, cond, seed=0, drift=True):
     wl_nom = np.asarray(wl_nom, float); N = len(wl_nom)
     C = field["C"]; H, W = C.shape[1:]
     wl_act, I0s = illum(wl_nom, cond)
-    Mt = stain_matrix(wl_act, cond.batch)
+    Mt = true_matrix(wl_act, cond, rng)
     Cs = C * BATCH_SCALE[cond.batch][:, None, None]
     OD = np.einsum("nk,khw->nhw", Mt, Cs)
     if field.get("D") is not None:
         OD = OD + defect_spectrum(wl_act)[:, None, None] * field["D"][None]
     T = np.exp(-OD)
+    if cond.hard:                                    # defocus (+ chromatic aberration) and stray light
+        blur = rng.uniform(*HARD["blur_px"])
+        for i in range(N):
+            T[i] = ndi.gaussian_filter(T[i], blur * (1 + HARD["chroma"] * abs(wl_act[i] - 530) / 300), mode="nearest")
+        T = (1 - HARD["stray"]) * T + HARD["stray"]
     ri = ref_index(wl_nom); true_shift = np.zeros((N, 2))
     if drift:
         for i in range(N):
@@ -234,15 +291,29 @@ def _prep(im):
     return (g - g.mean()) / (g.std() + 1e-9)
 
 
-def register(stack, ri):
-    base = _prep(stack[ri]); out = np.empty_like(stack); shifts = np.zeros((len(stack), 2))
-    for i, f in enumerate(stack):
-        if i == ri:
-            out[i] = f; continue
-        s, _, _ = phase_cross_correlation(base, _prep(f), upsample_factor=20, normalization=None)
-        if np.abs(s).max() > 6:                       # implausible -> low-contrast frame. I am keeping it unshifted
-            s = np.zeros(2)
-        shifts[i] = s; out[i] = ndi.shift(f, s, order=1, mode="nearest")
+def register(stack, ri, wl=None):
+    """Align every frame to the reference frame. With wl given, mid-visible/red frames (which have almost no
+    contrast against the 530 nm reference) may instead be aligned to their nearest already-aligned neighbour
+    wavelength; whichever anchor gives the better correlation score is used. NIR frames (>750 nm) are always
+    aligned directly to the reference, because chaining through noisy frames accumulates error."""
+    base = _prep(stack[ri]); out = np.empty_like(stack); shifts = np.zeros((len(stack), 2)); out[ri] = stack[ri]
+    if wl is None:
+        order, done = [i for i in range(len(stack)) if i != ri], [ri]
+    else:
+        wl = np.asarray(wl, float)
+        order, done = sorted([i for i in range(len(stack)) if i != ri], key=lambda i: abs(wl[i] - wl[ri])), [ri]
+    for i in order:
+        anchors = {ri}
+        if wl is not None and wl[i] <= 750:
+            anchors.add(min(done, key=lambda j: abs(wl[j] - wl[i])))
+        best = None
+        for a in anchors:
+            ref_img = base if a == ri else _prep(out[a])
+            s, err, _ = phase_cross_correlation(ref_img, _prep(stack[i]), upsample_factor=20, normalization=None)
+            if np.abs(s).max() <= 6 and (best is None or err < best[1]):   # >6 px = implausible, low-contrast frame
+                best = (s, err)
+        s = best[0] if best else np.zeros(2)
+        shifts[i] = s; out[i] = ndi.shift(stack[i], s, order=1, mode="nearest"); done.append(i)
     return out, shifts
 
 
@@ -266,7 +337,7 @@ def unmix(od, M, w=None, method="lstsq"):
 
 def run_pipeline(acq, M, weighted=True, method="lstsq"):
     wl = acq["wl"]
-    reg, shifts = register(acq["stack"], ref_index(wl))
+    reg, shifts = register(acq["stack"], ref_index(wl), wl)
     od = to_od(reg, acq["ref"])
     m = acq["ref"].mean((1, 2)); w = (m / m.max()) ** 2 if weighted else np.ones(len(wl))  # inverse-variance
     Cc = unmix(od, M, w, method)
@@ -303,7 +374,7 @@ def calibrate_M(cond_t, wl_t, seed=5):
         C[:, :, p * t:(p + 1) * t] = PATCHES[:, p][:, None, None]
     a = acquire(dict(C=C, D=None, labelmap=None, cells=[], dmask=None), wl, cond, seed, drift=False)
     od = to_od(a["stack"], a["ref"])
-    Y = np.stack([od[:, :, p * t:(p + 1) * t].mean((1, 2)) for p in range(P)], 1)  # (N,P)
+    Y = np.stack([od[:, 3:-3, p * t + 3:(p + 1) * t - 3].mean((1, 2)) for p in range(P)], 1)  # (N,P) tile interiors
     return np.stack([nnls(PATCHES.T, Y[i])[0] for i in range(len(wl))])
 
 
@@ -313,14 +384,14 @@ def get_M(mmode, cond, wl):
 
 def true_M_effective(cond, wl):
     wl_act, _ = illum(wl, cond)
-    return stain_matrix(wl_act, cond.batch) * BATCH_SCALE[cond.batch][None]
+    return true_matrix(wl_act, cond) * BATCH_SCALE[cond.batch][None]
 
 
 @functools.lru_cache(maxsize=64)
 def clean_residual(cond_t, wl_t, mmode, weighted):
     """Residual distribution from a defect-free 'clean slide' imaged on the same rig -> anomaly threshold."""
     cond = Cond(*cond_t); wl = np.array(wl_t, float)
-    a = acquire(make_field(4242), wl, cond, 4242)
+    a = acquire(make_field(4242, hard=bool(cond.hard)), wl, cond, 4242)
     return run_pipeline(a, get_M(mmode, cond, wl), weighted)["res"].ravel()
 
 
@@ -342,18 +413,36 @@ def channels(P, wl, method):
     return {"rgb": P["reg"][i], "odrgb": P["od"][i], "unmix": P["C"]}[method]
 
 
+def matched_cells(P, acq, wl, min_frac=0.5):
+    """Segment exactly as the API does, then label each segment with the true cell it overlaps.
+    Merged blobs, fragments and background specks are dropped."""
+    lab, cells = segment(P["od"], wl)
+    true = acq["labelmap"]; tid = {c["id"]: c for c in acq["cells"]}
+    out, used = [], set()
+    for c in cells:
+        m = lab == c["id"]
+        cnt = np.bincount(true[m], minlength=len(acq["cells"]) + 1); cnt[0] = 0
+        j = int(cnt.argmax())
+        if j == 0 or j in used or cnt[j] < min_frac * m.sum() or cnt[j] < min_frac * (true == j).sum():
+            continue
+        used.add(j); out.append((m, c["x"], c["y"], tid[j]["ctype"]))
+    return out
+
+
 @functools.lru_cache(maxsize=128)
-def build(seeds, cond_t, wl_t, mmode, weighted):
+def build(seeds, cond_t, wl_t, mmode, weighted, seg=True):
     cond = Cond(*cond_t); wl = np.array(wl_t, float); M = get_M(mmode, cond, wl)
     F = {m: [] for m in METHODS}; X = {m: [] for m in METHODS}; ct, res = [], []
     for s in seeds:
-        a = acquire(make_field(s), wl, cond, s); P = run_pipeline(a, M, weighted)
+        a = acquire(make_field(s, hard=bool(cond.hard)), wl, cond, s); P = run_pipeline(a, M, weighted)
         res.append(float(P["res"].mean()))
         chs = {m: channels(P, wl, m) for m in METHODS}
-        for c in a["cells"]:
-            msk = a["labelmap"] == c["id"]; ct.append(c["ctype"])
+        items = matched_cells(P, a, wl) if seg else \
+            [(a["labelmap"] == c["id"], c["x"], c["y"], c["ctype"]) for c in a["cells"]]
+        for msk, cx, cy, ctype in items:
+            ct.append(ctype)
             for m in METHODS:
-                F[m].append(cell_feats(chs[m], msk)); X[m].append(crop(chs[m], c["x"], c["y"]).astype(np.float32))
+                F[m].append(cell_feats(chs[m], msk)); X[m].append(crop(chs[m], cx, cy).astype(np.float32))
     return dict(ct=np.array(ct), F={m: np.array(v) for m, v in F.items()}, X={m: np.array(v) for m, v in X.items()}, res=np.array(res))
 
 
@@ -382,6 +471,8 @@ COND_SET = {
     "Camera B (IR-cut, noisier)": Cond(camera="B"),
     "Aged stain batch": Cond(batch="aged"),
     "Rig B (cross-device)": Cond(camera="B", rig="B", brightness=.85),
+    "Low light + noisy": Cond(brightness=.35, noise=3.0),
+    "Worst case (aged+rig B+dim)": Cond(brightness=.5, camera="B", batch="aged", rig="B", noise=2.0),
 }
 
 
