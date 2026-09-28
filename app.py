@@ -1,5 +1,5 @@
 """Multispectral Blood Smear Scanner """
-import io, time, zipfile
+import io, os, time, zipfile
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -55,7 +55,7 @@ def cond_widget(key, default=None):
     return sc.Cond(b, cam, bt, rig, nz)
 
 
-# ------------------------------- sidebar -------------------------------
+#  sidebar 
 st.sidebar.title("Scanner configuration")
 preset = st.sidebar.radio("LED set", ["Extended 7-LED", "Base 4-LED", "Custom"])
 if preset == "Custom":
@@ -97,13 +97,15 @@ residual anomaly map + classifiers + digital re-staining. Every feature works on
 | F8 Digital re-staining | 6 |
 | F9 CNNs + extensible multi-task registry | 5 |
 """)
-    st.warning("Simulator results demonstrate the *method's mechanics*, not the clinical performance. The simulator's physics "
-               "(spectra, noise, drift) is a model I wrote; real slides will behave worse in ways it cannot show. "
-               "Use prepared, fixed educational slides only.")
+    st.warning("All results on this page come from a SIMULATOR, so they demonstrate the method's mechanics, not clinical performance. "
+               "The simulator is deliberately imperfect (stain spectra differ from the literature, stray light, defocus, platelet/precipitate "
+               "look-alikes, faint parasites) but it is still a model I wrote; real slides will behave worse in ways it cannot show. "
+               "The assumptions are listed in core.HARD. Compare against the flat-fielded RGB baseline, not raw RGB - most of the "
+               "invariance comes from flat-fielding. Use prepared, fixed educational slides only.")
     st.caption("Registered tasks (add a dict entry in core.TASKS + a dataset to add a task; upstream stages are untouched): "
                + ", ".join(f"{k} {v['classes']}" for k, v in sc.TASKS.items()))
 
-# ------------------------------- acquire -------------------------------
+# acquire
 with tabs[1]:
     src = st.radio("Data source", ["Simulator", "Upload capture", "Live hardware"], horizontal=True)
     if src == "Simulator":
@@ -204,7 +206,8 @@ with tabs[2]:
                                        "estimated (y,x)": [tuple(np.round(s, 2)) for s in P["shifts"]]}), hide_index=True)
         else:
             st.dataframe(pd.DataFrame({"wavelength": nl, "estimated shift (y,x)": [tuple(np.round(s, 2)) for s in P["shifts"]]}), hide_index=True)
-        st.caption("Low-contrast frames (far red / NIR) can fail to register; implausible shifts (>6 px) are rejected and left unshifted.")
+        st.caption("Low-contrast frames (far red / NIR) can fail to register; implausible shifts (>6 px) are rejected and left unshifted. "
+                   "Red/mid frames may be aligned to a neighbouring wavelength instead of the 530 nm reference; NIR frames are always aligned to the reference.")
         st.subheader("Optical density  OD = -log(I / I0)")
         show(strip(list(P["od"]), nl, cmap="magma", vmin=0, vmax=1.2))
         st.subheader("Unmixed stain concentrations")
@@ -283,34 +286,56 @@ with tabs[4]:
             pv = df.pivot(index="condition", columns="method", values=met).loc[[s for s in sel if s in set(df.condition)]]
             pv.plot.bar(ax=a, rot=25, legend=a is ax[0]); a.set_ylim(0, 1.05); a.set_title(met); a.set_xlabel("")
         fig.tight_layout(); show(fig)
-        fig, a = plt.subplots(figsize=(6, 2.6)); a.boxplot(list(resid.values()), labels=list(resid), vert=True); a.set_ylabel("mean residual"); a.tick_params(axis="x", rotation=25, labelsize=7)
+        fig, a = plt.subplots(figsize=(6, 2.6)); a.boxplot(list(resid.values()), vert=True); a.set_xticklabels(list(resid)); a.set_ylabel("mean residual"); a.tick_params(axis="x", rotation=25, labelsize=7)
         a.set_title("Unmixing residual per condition (stable = calibration working)", fontsize=9); fig.tight_layout(); show(fig)
         u = df[df.method == sc.METHOD_NAMES["unmix"]].set_index("condition").macro_f1
         bad = [k for k in u.index if u[k] < u.get("Baseline", 1) - .05]
         st.info("Where the unmixed method still degrades (>0.05 macro-F1 below baseline): " + (", ".join(f"{k} ({u[k]:.2f})" for k in bad) if bad else "none in this run")
                 + ". Try the 4-LED set, camera B or literature M to see the failure modes; report them honestly.")
+        st.caption("The fair comparison for the spectral method is 'Unmixed' vs 'Flat-fielded RGB (OD)'. 'Raw RGB' has no flat-fielding, so it "
+                   "mainly shows the benefit of calibration, not of unmixing. For confidence intervals and paired tests use `python -m backend.train`.")
         st.dataframe(df.round(3), hide_index=True)
     with st.expander("Benchmark on public data before hardware exists (NIH malaria cell images, RGB only)"):
         z = st.file_uploader("ZIP containing Parasitized/ and Uninfected/ folders", type=["zip"])
-        if z is not None and st.button("Run 5-fold benchmark"):
-            from sklearn.model_selection import cross_val_predict
-            X, y = [], []
+        n_per = st.slider("Images per class (random, balanced)", 100, 1500, 500, 50)
+        if z is not None and st.button("Run grouped 5-fold benchmark"):
+            from sklearn.model_selection import GroupKFold, cross_val_predict
+            rng = np.random.default_rng(0)
             with zipfile.ZipFile(z) as zf:
-                for n in zf.namelist():
-                    l = n.lower()
-                    lab = 0 if "uninfect" in l else 1 if "parasit" in l else None
-                    if lab is None or not l.endswith((".png", ".jpg", ".jpeg")) or len(y) >= 1500: continue
-                    im = np.asarray(Image.open(zf.open(n)).convert("RGB").resize((48, 48)), float).transpose(2, 0, 1) / 255
-                    X.append(sc.cell_feats(im, im.sum(0) > .15)); y.append(lab)
-            p = cross_val_predict(sc.RandomForestClassifier(300, random_state=0, n_jobs=-1, class_weight="balanced"), np.array(X), np.array(y), cv=5)
-            a_, f_ = sc.scores(np.array(y), p); st.success(f"{len(y)} images | accuracy {a_:.3f} | macro-F1 {f_:.3f} (raw-RGB baseline only)")
+                imgs_ = [n for n in zf.namelist() if n.lower().endswith((".png", ".jpg", ".jpeg"))]
+                pos = [n for n in imgs_ if "parasit" in n.lower()]; neg = [n for n in imgs_ if "uninfect" in n.lower()]
+                k = min(n_per, len(pos), len(neg))
+                if k < 20:
+                    st.error(f"Found {len(pos)} parasitized and {len(neg)} uninfected images; need folders named Parasitized/ and Uninfected/.")
+                else:
+                    pick = [(n, 1) for n in rng.choice(pos, k, replace=False)] + [(n, 0) for n in rng.choice(neg, k, replace=False)]
+                    X, y, grp = [], [], []
+                    for n, lab in pick:
+                        im = np.asarray(Image.open(zf.open(n)).convert("RGB").resize((48, 48)), float).transpose(2, 0, 1) / 255
+                        X.append(sc.cell_feats(im, im.sum(0) > .15)); y.append(lab)
+                        grp.append(os.path.basename(n).split("_")[0])     # NIH filenames start with a slide/patient code
+                    X, y, grp = np.array(X), np.array(y), np.array(grp)
+                    ng = len(np.unique(grp))
+                    if ng < 5:
+                        st.warning(f"Only {ng} distinct slide codes parsed from filenames, so folds cannot be grouped by slide; "
+                                   "results below may be inflated by cells from the same slide appearing in train and test.")
+                        from sklearn.model_selection import StratifiedKFold
+                        cv = StratifiedKFold(5, shuffle=True, random_state=0); groups_arg = None
+                    else:
+                        cv = GroupKFold(5); groups_arg = grp
+                    p = cross_val_predict(sc.RandomForestClassifier(300, random_state=0, n_jobs=-1, class_weight="balanced"), X, y, cv=cv, groups=groups_arg)
+                    a_, f_ = sc.scores(y, p)
+                    st.success(f"{len(y)} images ({k} per class, {ng} slide codes) | accuracy {a_:.3f} | macro-F1 {f_:.3f} "
+                               f"| raw-RGB baseline only, folds split by slide")
+                    st.caption("Grouping by slide prevents leakage across folds, but note that infected and healthy cells in this dataset can come from "
+                               "different patients, so slide identity may itself correlate with the label.")
 
-# ------------------------------- deep learning -------------------------------
+#  deep learning 
 with tabs[5]:
     st.subheader("CNNs on unmixed channels + extensible tasks (Feature 9)")
     st.markdown("Upstream stages (capture -> register -> flat-field -> OD -> unmix) are shared; a task is only a label rule + a small classifier head. "
                 "Prove one task rigorously (malaria) before adding another (`wbc_diff`).")
-    st.code("# core.py - add a task in one line, nothing upstream changes\nTASKS['my_task'] = dict(classes=['a','b'], types=('ctype_a','ctype_b'))", "python")
+    st.code("# core.py - add a task in one line, nothing upstream changes\nTASKS['my_task'] = dict(classes=['a','b'], types=('ctype_a','ctype_b'), family='rbc')", "python")
     if not sc.torch_ok():
         st.warning("PyTorch not installed - only the classical model will run. `pip install torch torchvision` for the scratch CNN and adapted ResNet18.")
     d1, d2, d3, d4 = st.columns(4)
@@ -359,14 +384,15 @@ with tabs[7]:
     mdl = models(ltask, WL_T, mmode, weighted)
 
     def run_field(seed, cond):
-        a = sc.acquire(sc.make_field(seed), wl, cond, seed); Pp = sc.run_pipeline(a, sc.get_M(mmode, cond, wl), weighted)
-        out = {}
+        a = sc.acquire(sc.make_field(seed, hard=bool(cond.hard)), wl, cond, seed); Pp = sc.run_pipeline(a, sc.get_M(mmode, cond, wl), weighted)
+        out = {}; items = sc.matched_cells(Pp, a, wl)          # segmented masks, as the API sees them
         for m in sc.METHODS:
             chs = sc.channels(Pp, wl, m); res = []
-            for c in a["cells"]:
-                if c["ctype"] not in sc.TASKS[ltask]["types"]: continue
-                f = sc.cell_feats(chs, a["labelmap"] == c["id"])[None]
-                res.append((c, int(mdl[m].predict(f)[0]), int(c["ctype"] == sc.TASKS[ltask]["types"][1])))
+            for msk, cx, cy, ctype in items:
+                if ctype not in sc.TASKS[ltask]["types"]: continue
+                f = sc.cell_feats(chs, msk)[None]
+                res.append((dict(x=cx, y=cy, r=float(np.sqrt(msk.sum() / np.pi))), int(mdl[m].predict(f)[0]),
+                            int(ctype == sc.TASKS[ltask]["types"][1])))
             out[m] = res
         return a, out
 
@@ -378,7 +404,8 @@ with tabs[7]:
             ax.add_patch(plt.Circle((c["x"], c["y"]), c["r"] + 2, fill=False, ec="lime" if p == y else "red", lw=1.5))
         acc = np.mean([p == y for _, p, y in out[m]]) if out[m] else float("nan")
         ax.set_title(f"{sc.METHOD_NAMES[m]}: {acc:.0%} correct", fontsize=9); col.pyplot(fig); plt.close(fig)
-    st.caption("Image shown is what an RGB camera would record (no flat-field). Green ring = correct, red = wrong.")
+    st.caption("Image shown is what an RGB camera would record (no flat-field). Green ring = correct, red = wrong. "
+               "For the fair flat-fielded comparison see tab 4.")
     if st.button("Auto-sweep: dim the LEDs step by step"):
         ph, xs, ys = st.empty(), [], {m: [] for m in sc.METHODS}
         for b in (1.4, 1.0, .8, .6, .45, .35):
