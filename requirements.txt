@@ -10,9 +10,11 @@ torch          # scratch CNN + adapted ResNet18 (Feature 9)
 torchvision
 pyserial       # Arduino LED control
 opencv-python  # USB camera capture
-# picamera2    # Raspberry Pi camera 
+# picamera2   # Raspberry Pi camera 
 fastapi
 uvicorn[standard]
 python-multipart
 sqlalchemy>=2.0
-psycopg2-binary  
+joblib
+# psycopg2-binary  
+requests
