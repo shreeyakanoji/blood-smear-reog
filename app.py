@@ -2,6 +2,7 @@
 import io, os, time, zipfile
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
@@ -55,7 +56,7 @@ def cond_widget(key, default=None):
     return sc.Cond(b, cam, bt, rig, nz)
 
 
-#  sidebar 
+# ------------------------------- sidebar -------------------------------
 st.sidebar.title("Scanner configuration")
 preset = st.sidebar.radio("LED set", ["Extended 7-LED", "Base 4-LED", "Custom"])
 if preset == "Custom":
@@ -74,7 +75,7 @@ st.sidebar.caption(f"N = {len(wl)} wavelengths vs K = {sc.K} components -> "
                       "over-determined: residual usable" if len(wl) > sc.K else "UNDER-determined"))
 
 tabs = st.tabs(["Overview", "1 Acquire", "2 Pipeline + anomalies", "3 Calibration", "4 Classifier + invariance",
-                "5 Deep learning + tasks", "6 Digital re-staining", "7 Live demo"])
+                "5 Deep learning + tasks", "6 Digital re-staining", "7 Live demo", "8 Backend API"])
 
 
 with tabs[0]:
@@ -105,7 +106,7 @@ residual anomaly map + classifiers + digital re-staining. Every feature works on
     st.caption("Registered tasks (add a dict entry in core.TASKS + a dataset to add a task; upstream stages are untouched): "
                + ", ".join(f"{k} {v['classes']}" for k, v in sc.TASKS.items()))
 
-# acquire
+# ------------------------------- acquire -------------------------------
 with tabs[1]:
     src = st.radio("Data source", ["Simulator", "Upload capture", "Live hardware"], horizontal=True)
     if src == "Simulator":
@@ -330,7 +331,7 @@ with tabs[4]:
                     st.caption("Grouping by slide prevents leakage across folds, but note that infected and healthy cells in this dataset can come from "
                                "different patients, so slide identity may itself correlate with the label.")
 
-#  deep learning 
+# deep learning
 with tabs[5]:
     st.subheader("CNNs on unmixed channels + extensible tasks (Feature 9)")
     st.markdown("Upstream stages (capture -> register -> flat-field -> OD -> unmix) are shared; a task is only a label rule + a small classifier head. "
@@ -417,3 +418,67 @@ with tabs[7]:
             fig, ax = plt.subplots(figsize=(6, 2.8))
             for m in sc.METHODS: ax.plot(xs, ys[m], "o-", label=sc.METHOD_NAMES[m])
             ax.set_xlabel("LED brightness"); ax.set_ylabel("accuracy"); ax.set_ylim(0, 1.05); ax.legend(fontsize=6); ph.pyplot(fig); plt.close(fig)
+
+
+# ------------------------------- live backend API -------------------------------
+with tabs[8]:
+    st.subheader("Send a capture to the deployed backend (trained model, not a live-retrained demo)")
+    st.caption("This calls a real FastAPI backend over HTTPS - see the deployment guide for hosting it on Hugging Face Spaces.")
+    c1, c2 = st.columns(2)
+    api_url = c1.text_input("Backend URL", st.session_state.get("api_url", "https://your-username-your-space.hf.space")).rstrip("/")
+    api_key = c2.text_input("API key", st.session_state.get("api_key", ""), type="password")
+    st.session_state.api_url, st.session_state.api_key = api_url, api_key
+    H = {"X-API-Key": api_key}
+
+    if st.button("Check backend health + list trained models"):
+        try:
+            h = requests.get(f"{api_url}/health", timeout=15).json()
+            st.success(f"Backend reachable. Trained model versions: {h.get('models', [])}")
+            if api_key:
+                m = requests.get(f"{api_url}/models", headers=H, timeout=15)
+                if m.status_code == 200:
+                    drop = ("test_results", "paired_deltas", "gate_results", "simulator_assumptions", "hyperparameters")
+                    st.dataframe(pd.DataFrame([{k: v for k, v in row.items() if k not in drop} for row in m.json()]), hide_index=True)
+                else:
+                    st.warning(f"/models returned {m.status_code} - check your API key")
+        except Exception as e:
+            st.error(f"Could not reach backend: {e}")
+
+    st.divider()
+    if acq is None:
+        st.info("Load a capture in tab 1 first (simulator, upload, or hardware).")
+    else:
+        st.caption(f"Will send the capture currently loaded in tab 1: {len(acq['wl'])} wavelengths {[int(w) for w in acq['wl']]}, "
+                   f"M mode = {mmode}. The backend rejects a capture whose wavelengths don't match its trained model's wavelength set.")
+        task_send = st.selectbox("Task", list(sc.TASKS), key="api_task")
+        if st.button("Send to backend", type="primary"):
+            try:
+                buf = io.BytesIO()
+                np.savez(buf, stack=acq["stack"], ref=acq["ref"], wl=acq["wl"], M=M)
+                r = requests.post(f"{api_url}/scans", headers=H, files={"file": ("capture.npz", buf.getvalue())},
+                                  data={"task": task_send}, timeout=60)
+                if r.status_code == 200:
+                    body = r.json()
+                    st.success(f"Scan {body['id']} - model {body['model_version']} ({body['model_data_source']})")
+                    st.warning(body["disclaimer"])
+                    st.dataframe(pd.DataFrame(body["cells"]), hide_index=True)
+                    fig, ax = plt.subplots(figsize=(4.5, 4.5))
+                    ax.imshow(sc.transmittance_rgb(P, acq["wl"]))
+                    for c in body["cells"]:
+                        col = "gray" if not c["in_scope"] else ("tomato" if c.get("label") == sc.TASKS[task_send]["classes"][1] else "lime")
+                        ax.add_patch(plt.Circle((c["x"], c["y"]), 6, fill=False, ec=col, lw=1.5))
+                    ax.axis("off"); ax.set_title("Backend result overlay (gray = out of scope for this task)", fontsize=8)
+                    st.pyplot(fig); plt.close(fig)
+                else:
+                    st.error(f"Backend returned {r.status_code}: {r.text[:500]}")
+            except Exception as e:
+                st.error(f"Request failed: {e}")
+
+    st.divider()
+    with st.expander("Past scans on this backend"):
+        if st.button("List recent scans"):
+            try:
+                r = requests.get(f"{api_url}/scans", headers=H, timeout=15)
+                st.dataframe(pd.DataFrame(r.json()), hide_index=True) if r.status_code == 200 else st.error(r.text[:300])
+            except Exception as e:
+                st.error(str(e))
