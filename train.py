@@ -7,10 +7,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score
 
 import core as sc
-from . import registry
+import registry
 
 VAL0, TEST0, PHYS0 = 500, 1000, 5000
 GRID = [dict(n_estimators=n, max_depth=d) for n in (100, 300) for d in (None, 8, 16)]
+
 
 
 def dataset(seeds, cond, wl_t, mmode, weighted, task, meth):
@@ -20,6 +21,16 @@ def dataset(seeds, cond, wl_t, mmode, weighted, task, meth):
         X, y = sc.subset(d, task, meth)
         if len(y):
             Xs.append(X); ys.append(y); gs.append(np.full(len(y), s))
+    return np.concatenate(Xs), np.concatenate(ys), np.concatenate(gs)
+
+
+def gate_dataset(seeds, cond, wl_t, mmode, weighted):
+    """All segmented cells (any type); label 1 = white cell. Uses unmixed features, as the API does."""
+    Xs, ys, gs = [], [], []
+    for s in seeds:
+        d = sc.build((s,), tuple(cond), wl_t, mmode, weighted)
+        if len(d["ct"]):
+            Xs.append(d["F"]["unmix"]); ys.append(np.array([sc.family_of(t) == "wbc" for t in d["ct"]], int)); gs.append(np.full(len(d["ct"]), s))
     return np.concatenate(Xs), np.concatenate(ys), np.concatenate(gs)
 
 
@@ -55,36 +66,48 @@ def boot_ci(groups, stat, B=1000, seed=0):
     return tuple(float(x) for x in np.nanpercentile(v, [2.5, 97.5]))
 
 
-def evaluate(task, models, wl_t, mmode, weighted, n_test):
-    rows, deltas = [], []
+def evaluate(task, models, wl_t, mmode, weighted, n_test, conds):
+    rows, deltas, gate_rows = [], [], []
     seeds = range(TEST0, TEST0 + n_test)
-    for name, cond in sc.COND_SET.items():
+    fam_wbc = sc.TASKS[task]["family"] == "wbc"
+    for name, cond in conds.items():
         pred, prob, ys, g = {}, {}, {}, None
         for m in sc.METHODS:
             X, y, g = dataset(seeds, cond, wl_t, mmode, weighted, task, m)
             pred[m] = models[m].predict(X); prob[m] = models[m].predict_proba(X)[:, 1]; ys[m] = y
         y = ys["unmix"]
         assert all(np.array_equal(y, ys[m]) for m in sc.METHODS), "cell order differs between methods"
+
+        
+        Xu, _, _ = dataset(seeds, cond, wl_t, mmode, weighted, task, "unmix")
+        routed = (models["gate"].predict(Xu) == 1) == fam_wbc
+        e2e = float(np.mean(routed & (pred["unmix"] == y)))
         for m in sc.METHODS:
             lo, hi = boot_ci(g, lambda ix, p=pred[m]: macro_f1(y[ix], p[ix]))
             rows.append(dict(condition=name, method=m, n_fields=len(np.unique(g)), n_cells=len(y),
-                             **rates(y, pred[m], prob[m]), f1_lo=lo, f1_hi=hi))
-        # paired comparison: does unmixing beat plain flat-fielded RGB, on the same resampled fields?
+                             **rates(y, pred[m], prob[m]), f1_lo=lo, f1_hi=hi, e2e_accuracy=e2e if m == "unmix" else np.nan))
+        Xg, yg, gg = gate_dataset(seeds, cond, wl_t, mmode, weighted)
+        pg = models["gate"].predict(Xg)
+        lo, hi = boot_ci(gg, lambda ix: float(np.mean(yg[ix] == pg[ix])))
+        gate_rows.append(dict(condition=name, gate_accuracy=float(np.mean(yg == pg)), acc_lo=lo, acc_hi=hi,
+                              wbc_recall=float(np.mean(pg[yg == 1] == 1)) if (yg == 1).any() else np.nan,
+                              rbc_recall=float(np.mean(pg[yg == 0] == 0)), n_cells=len(yg)))
+        
         d = lambda ix: macro_f1(y[ix], pred["unmix"][ix]) - macro_f1(y[ix], pred["odrgb"][ix])
         lo, hi = boot_ci(g, d)
         deltas.append(dict(condition=name, unmix_minus_odrgb=d(np.arange(len(y))), ci_lo=lo, ci_hi=hi))
-    return rows, deltas
+    return rows, deltas, gate_rows
 
 
-def physics_checks(wl_t, mmode, weighted, n=10, k=5.0):
+def physics_checks(wl_t, mmode, weighted, cond, n=10, k=5.0):
     """Validates the UNTRAINED stages (registration, unmixing, residual anomaly flag) against simulator ground truth."""
-    wl, cond, ri = np.array(wl_t, float), sc.Cond(), sc.ref_index(wl_t)
+    wl, ri = np.array(wl_t, float), sc.ref_index(wl_t)
     cr = sc.clean_residual(tuple(cond), wl_t, mmode, weighted)
     thr = cr.mean() + k * cr.std()
     keep = [i for i in range(len(wl)) if i != ri]
     reg, corr, rec, fpr = [], [[] for _ in range(sc.K)], [], []
     for s in range(PHYS0, PHYS0 + n):
-        a = sc.acquire(sc.make_field(s, defects=True), wl, cond, s)
+        a = sc.acquire(sc.make_field(s, defects=True, hard=bool(cond.hard)), wl, cond, s)
         P = sc.run_pipeline(a, sc.get_M(mmode, cond, wl), weighted)
         reg.append(np.sqrt(np.mean((P["shifts"][keep] + a["true_shift"][keep]) ** 2)))
         for j in range(sc.K):
@@ -105,11 +128,14 @@ def main():
     ap.add_argument("--n-val", type=int, default=12)
     ap.add_argument("--n-test", type=int, default=30)
     ap.add_argument("--no-weight", action="store_true")
+    ap.add_argument("--easy", action="store_true", help="idealised simulator (old behaviour); results will look near-perfect")
     a = ap.parse_args()
     assert a.n_train <= VAL0 and a.n_val <= TEST0 - VAL0, "split ranges would overlap"
 
     wl_t = tuple(int(w) for w in (sc.EXT_WL if a.leds == "ext" else sc.BASE_WL))
-    weighted, base = not a.no_weight, sc.Cond()
+    weighted, hard = not a.no_weight, int(not a.easy)
+    base = sc.Cond(hard=hard)
+    conds = {k: c._replace(hard=hard) for k, c in sc.COND_SET.items()}
 
     models, hps = {}, {}
     for m in sc.METHODS:
@@ -118,19 +144,26 @@ def main():
         f, hps[m], models[m] = fit_best(Xtr, ytr, Xva, yva)
         print(f"{m:6s} val macro-F1 {f:.3f}  {hps[m]}  (train cells {len(ytr)}, val cells {len(yva)})")
 
-    rows, deltas = evaluate(a.task, models, wl_t, a.mmode, weighted, a.n_test)
-    phys = physics_checks(wl_t, a.mmode, weighted)
+    Xg, yg, _ = gate_dataset(range(a.n_train), base, wl_t, a.mmode, weighted)
+    Xgv, ygv, _ = gate_dataset(range(VAL0, VAL0 + a.n_val), base, wl_t, a.mmode, weighted)
+    f, hps["gate"], models["gate"] = fit_best(Xg, yg, Xgv, ygv)
+    print(f"gate   val macro-F1 {f:.3f}  {hps['gate']}  (train cells {len(yg)}, {int(yg.sum())} white)")
+
+    rows, deltas, gate_rows = evaluate(a.task, models, wl_t, a.mmode, weighted, a.n_test, conds)
+    phys = physics_checks(wl_t, a.mmode, weighted, base)
     cr = sc.clean_residual(tuple(base), wl_t, a.mmode, weighted)
 
-    show = ["condition", "method", "n_fields", "accuracy", "macro_f1", "f1_lo", "f1_hi", "sensitivity", "specificity", "auc"]
+    show = ["condition", "method", "n_fields", "accuracy", "macro_f1", "f1_lo", "f1_hi", "sensitivity", "specificity", "auc", "e2e_accuracy"]
     print("\nTEST (zero-shot on every non-baseline condition)")
     print(pd.DataFrame(rows)[show].round(3).to_string(index=False))
     print("\nPAIRED: unmixed minus flat-fielded RGB (macro-F1). CI excluding 0 = a real difference")
     print(pd.DataFrame(deltas).round(3).to_string(index=False))
+    print("\nGATE (red vs white cell routing)"); print(pd.DataFrame(gate_rows).round(3).to_string(index=False))
     print("\nPHYSICS CHECKS (untrained stages)"); print(phys)
 
-    meta = dict(data_source="simulator", classes=sc.TASKS[a.task]["classes"], wavelengths=list(wl_t),
-                mmode=a.mmode, weighted=weighted, hyperparameters=hps,
+    meta = dict(data_source="simulator" + ("-idealised" if a.easy else "-realistic"), classes=sc.TASKS[a.task]["classes"],
+                cell_family=sc.TASKS[a.task]["family"], wavelengths=list(wl_t), simulator_assumptions=(None if a.easy else sc.HARD),
+                mmode=a.mmode, weighted=weighted, hyperparameters=hps, gate_results=gate_rows,
                 splits=dict(train=[0, a.n_train], val=[VAL0, VAL0 + a.n_val], test=[TEST0, TEST0 + a.n_test], unit="field"),
                 test_results=rows, paired_deltas=deltas, physics_checks=phys,
                 clean_residual=dict(mean=float(cr.mean()), std=float(cr.std())),
