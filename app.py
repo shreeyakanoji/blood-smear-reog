@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image
 import core as sc
-
+import train as bt  
 st.set_page_config(page_title="Multispectral Smear Scanner", layout="wide")
 
 ARDUINO_SKETCH = r'''// LED sequencer. Serial 115200. Commands: "L<i>[,duty]\n" = only LED i on (duty 0-255), "X\n" = all off.
@@ -56,7 +56,7 @@ def cond_widget(key, default=None):
     return sc.Cond(b, cam, bt, rig, nz)
 
 
-# ------------------------------- sidebar -------------------------------
+#  sidebar 
 st.sidebar.title("Scanner configuration")
 preset = st.sidebar.radio("LED set", ["Extended 7-LED", "Base 4-LED", "Custom"])
 if preset == "Custom":
@@ -75,7 +75,7 @@ st.sidebar.caption(f"N = {len(wl)} wavelengths vs K = {sc.K} components -> "
                       "over-determined: residual usable" if len(wl) > sc.K else "UNDER-determined"))
 
 tabs = st.tabs(["Overview", "1 Acquire", "2 Pipeline + anomalies", "3 Calibration", "4 Classifier + invariance",
-                "5 Deep learning + tasks", "6 Digital re-staining", "7 Live demo", "8 Backend API"])
+                "5 Deep learning + tasks", "6 Digital re-staining", "7 Live demo", "8 Backend API", "9 Train + Test (no server)"])
 
 
 with tabs[0]:
@@ -99,14 +99,12 @@ residual anomaly map + classifiers + digital re-staining. Every feature works on
 | F9 CNNs + extensible multi-task registry | 5 |
 """)
     st.warning("All results on this page come from a SIMULATOR, so they demonstrate the method's mechanics, not clinical performance. "
-               "The simulator is deliberately imperfect (stain spectra differ from the literature, stray light, defocus, platelet/precipitate "
-               "look-alikes, faint parasites) but it is still a model I wrote; real slides will behave worse in ways it cannot show. "
                "The assumptions are listed in core.HARD. Compare against the flat-fielded RGB baseline, not raw RGB - most of the "
                "invariance comes from flat-fielding. Use prepared, fixed educational slides only.")
     st.caption("Registered tasks (add a dict entry in core.TASKS + a dataset to add a task; upstream stages are untouched): "
                + ", ".join(f"{k} {v['classes']}" for k, v in sc.TASKS.items()))
 
-# ------------------------------- acquire -------------------------------
+# acquire 
 with tabs[1]:
     src = st.radio("Data source", ["Simulator", "Upload capture", "Live hardware"], horizontal=True)
     if src == "Simulator":
@@ -331,7 +329,7 @@ with tabs[4]:
                     st.caption("Grouping by slide prevents leakage across folds, but note that infected and healthy cells in this dataset can come from "
                                "different patients, so slide identity may itself correlate with the label.")
 
-# deep learning
+# ------------------------------- deep learning -------------------------------
 with tabs[5]:
     st.subheader("CNNs on unmixed channels + extensible tasks (Feature 9)")
     st.markdown("Upstream stages (capture -> register -> flat-field -> OD -> unmix) are shared; a task is only a label rule + a small classifier head. "
@@ -482,3 +480,104 @@ with tabs[8]:
                 st.dataframe(pd.DataFrame(r.json()), hide_index=True) if r.status_code == 200 else st.error(r.text[:300])
             except Exception as e:
                 st.error(str(e))
+
+
+# validate + test
+with tabs[9]:
+    st.subheader("Train, validate and test entirely inside this app")
+    st.caption("Runs the exact same logic as `python train.py` on the command line, in this app's process. The trained model "
+               "lives only in this session's memory - it's lost if the app restarts or goes to sleep. For a model that "
+               "survives restarts, train.py still writes a versioned copy to ./models when run from a terminal.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    ttask = c1.selectbox("Task", list(sc.TASKS), key="tt")
+    tleds = c2.radio("LED set", ["Extended (7)", "Base (4)"], key="tleds", horizontal=True)
+    tmmode = c3.radio("M mode", ["literature", "calibrated"], key="tmmode", horizontal=True)
+    tweighted = c4.checkbox("SNR-weighted", True, key="tw")
+    twl_t = tuple(int(w) for w in (sc.EXT_WL if tleds.startswith("Ext") else sc.BASE_WL))
+
+    c5, c6, c7 = st.columns(3)
+    n_train = c5.slider("Training fields", 8, 48, 16, key="n_tr", help="Larger = slower but more reliable. Start small on a free Streamlit instance.")
+    n_val = c6.slider("Validation fields", 4, 16, 6, key="n_va")
+    n_test = c7.slider("Test fields per condition", 4, 20, 8, key="n_te")
+    tconds = st.multiselect("Conditions to validate against", list(sc.COND_SET), default=list(sc.COND_SET), key="tconds")
+    st.caption(f"Estimated time: roughly {(n_train + n_val) * 0.3 + n_test * len(tconds) * 0.25:.0f}-"
+               f"{(n_train + n_val) * 0.6 + n_test * len(tconds) * 0.5:.0f} seconds on typical free-tier hosting. "
+               "The app UI will be busy (not frozen) while this runs - don't close the tab.")
+
+    if st.button("Train + validate now", type="primary"):
+        base = sc.Cond()
+        t0 = time.time()
+        with st.spinner("Training classifiers (rgb, odrgb, unmix, gate)..."):
+            models, hps = {}, {}
+            for m in sc.METHODS:
+                Xtr, ytr, _ = bt.dataset(range(n_train), base, twl_t, tmmode, tweighted, ttask, m)
+                Xva, yva, _ = bt.dataset(range(bt.VAL0, bt.VAL0 + n_val), base, twl_t, tmmode, tweighted, ttask, m)
+                f, hps[m], models[m] = bt.fit_best(Xtr, ytr, Xva, yva)
+            Xg, yg, _ = bt.gate_dataset(range(n_train), base, twl_t, tmmode, tweighted)
+            Xgv, ygv, _ = bt.gate_dataset(range(bt.VAL0, bt.VAL0 + n_val), base, twl_t, tmmode, tweighted)
+            _, hps["gate"], models["gate"] = bt.fit_best(Xg, yg, Xgv, ygv)
+        with st.spinner(f"Evaluating on {n_test} held-out fields x {len(tconds)} condition(s)..."):
+            conds = {k: sc.COND_SET[k] for k in tconds}
+            rows, deltas, gate_rows = bt.evaluate(ttask, models, twl_t, tmmode, tweighted, n_test, conds)
+        with st.spinner("Running physics sanity checks..."):
+            phys = bt.physics_checks(twl_t, tmmode, tweighted, base, n=6)
+        st.session_state.trained = dict(models=models, task=ttask, wl_t=twl_t, mmode=tmmode, weighted=tweighted,
+                                        classes=sc.TASKS[ttask]["classes"], family=sc.TASKS[ttask]["family"],
+                                        trained_at=time.strftime("%Y-%m-%d %H:%M:%S"), elapsed=time.time() - t0,
+                                        rows=rows, deltas=deltas, gate_rows=gate_rows, phys=phys, hps=hps)
+        st.success(f"Trained and validated in {time.time() - t0:.0f}s. Model is now live for testing below (tab 1's capture, or manual entry).")
+
+    if "trained" in st.session_state:
+        tr = st.session_state.trained
+        st.info(f"Live model: task={tr['task']} | LEDs={tr['wl_t']} | M={tr['mmode']} | trained {tr['trained_at']} "
+               f"({tr['elapsed']:.0f}s) | DATA SOURCE: simulator-{'realistic' if sc.Cond().hard else 'idealised'}")
+        st.markdown("**Held-out test results** (zero-shot on every non-baseline condition; trained only on Baseline)")
+        show_cols = ["condition", "method", "n_fields", "accuracy", "macro_f1", "f1_lo", "f1_hi", "sensitivity", "specificity", "auc"]
+        dfres = pd.DataFrame(tr["rows"])
+        st.dataframe(dfres[[c for c in show_cols if c in dfres.columns]].round(3), hide_index=True)
+        st.markdown("**Paired comparison** - unmixed minus flat-fielded RGB (macro-F1). CI excluding 0 = a real difference, not noise.")
+        st.dataframe(pd.DataFrame(tr["deltas"]).round(3), hide_index=True)
+        st.markdown("**Gate** (routing red vs. white cells to the right task)")
+        st.dataframe(pd.DataFrame(tr["gate_rows"]).round(3), hide_index=True)
+        st.markdown("**Physics checks** (untrained stages: registration, unmixing, defect detection)")
+        st.json(tr["phys"])
+        st.caption("These numbers are from THIS session's run - they'll vary slightly between runs (different random fields) "
+                   "and depend heavily on n_train/n_val/n_test above. Small field counts give noisy, wide confidence intervals; "
+                   "that's honest behaviour, not a bug.")
+
+        st.divider()
+        st.subheader("Test the live model on a capture")
+        if acq is None:
+            st.info("Load a capture in tab 1 first.")
+        elif tuple(int(w) for w in acq["wl"]) != tr["wl_t"]:
+            st.warning(f"Tab 1's capture uses wavelengths {[int(w) for w in acq['wl']]}, but this model was trained on "
+                      f"{tr['wl_t']}. Match the LED set in tab 1's sidebar to this tab's LED set, then retrain or reload.")
+        else:
+            if acq.get("sim"):
+                items = sc.matched_cells(P, acq, acq["wl"])
+            else:
+                lab_seg, cells_seg = sc.segment(P["od"], acq["wl"])
+                items = [(lab_seg == c["id"], c["x"], c["y"], "unknown") for c in cells_seg]
+            ch = sc.channels(P, acq["wl"], "unmix")
+            out = []
+            for msk, cx, cy, truth in items:
+                is_wbc = int(tr["models"]["gate"].predict(sc.cell_feats(ch, msk)[None])[0]) == 1
+                in_scope = is_wbc == (tr["family"] == "wbc")
+                p = float(tr["models"]["unmix"].predict_proba(sc.cell_feats(ch, msk)[None])[0, 1]) if in_scope else None
+                out.append(dict(x=round(cx, 1), y=round(cy, 1), true_type=truth, cell_type="wbc" if is_wbc else "rbc",
+                                in_scope=in_scope, p_positive=None if p is None else round(p, 4),
+                                label=None if p is None else tr["classes"][int(p >= .5)]))
+            dfo = pd.DataFrame(out)
+            st.dataframe(dfo, hide_index=True)
+            if acq.get("sim"):
+                scored = dfo[dfo.in_scope & dfo.true_type.isin(sc.TASKS[tr["task"]]["types"])]
+                if len(scored):
+                    correct = (scored.label == tr["classes"][1]) == (scored.true_type == sc.TASKS[tr["task"]]["types"][1])
+                    st.metric("Accuracy on this field (in-scope cells, vs. simulator ground truth)", f"{correct.mean():.0%}", f"n={len(scored)}")
+            fig, ax = plt.subplots(figsize=(4.5, 4.5)); ax.imshow(sc.transmittance_rgb(P, acq["wl"])); ax.axis("off")
+            for _, r in dfo.iterrows():
+                col = "gray" if not r.in_scope else ("tomato" if r.label == tr["classes"][1] else "lime")
+                ax.add_patch(plt.Circle((r.x, r.y), 6, fill=False, ec=col, lw=1.5))
+            ax.set_title("gray = out of scope, green/red = in-scope prediction", fontsize=8)
+            st.pyplot(fig); plt.close(fig)
