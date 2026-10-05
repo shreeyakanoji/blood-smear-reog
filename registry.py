@@ -1,5 +1,3 @@
-"""Versioned model storage. Every saved model carries the metadata needed to trace a result
-back to how it was produced (data source, splits, metrics, hash of core.py)."""
 import hashlib
 import json
 import time
@@ -7,7 +5,7 @@ from pathlib import Path
 
 import joblib
 
-MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+MODEL_DIR = Path(__file__).resolve().parent / "models"
 
 
 def file_sha256(path):
@@ -35,7 +33,7 @@ def list_versions(task=None):
 def load_model(version=None, task=None):
     vs = list_versions(task)
     if not vs:
-        raise FileNotFoundError("no trained model found - run `python -m backend.train` first")
+        raise FileNotFoundError("no trained model found - run `python train.py` first")
     meta = next((m for m in vs if m["version"] == version), None) if version else vs[-1]
     if meta is None:
         raise FileNotFoundError(f"unknown model version {version}")
