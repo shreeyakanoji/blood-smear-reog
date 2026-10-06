@@ -13,7 +13,6 @@ VAL0, TEST0, PHYS0 = 500, 1000, 5000
 GRID = [dict(n_estimators=n, max_depth=d) for n in (100, 300) for d in (None, 8, 16)]
 
 
-
 def dataset(seeds, cond, wl_t, mmode, weighted, task, meth):
     Xs, ys, gs = [], [], []
     for s in seeds:
@@ -56,6 +55,8 @@ def rates(y, p, prob):
                 auc=roc_auc_score(y, prob) if len(np.unique(y)) == 2 else np.nan)
 
 
+
+
 def boot_ci(groups, stat, B=1000, seed=0):
     """95% CI by resampling whole fields (cells within a field are correlated,
     so resampling individual cells would give intervals that are too narrow)."""
@@ -64,6 +65,8 @@ def boot_ci(groups, stat, B=1000, seed=0):
     idx = {g: np.flatnonzero(groups == g) for g in ids}
     v = [stat(np.concatenate([idx[g] for g in rng.choice(ids, len(ids))])) for _ in range(B)]
     return tuple(float(x) for x in np.nanpercentile(v, [2.5, 97.5]))
+
+
 
 
 def evaluate(task, models, wl_t, mmode, weighted, n_test, conds):
@@ -77,8 +80,6 @@ def evaluate(task, models, wl_t, mmode, weighted, n_test, conds):
             pred[m] = models[m].predict(X); prob[m] = models[m].predict_proba(X)[:, 1]; ys[m] = y
         y = ys["unmix"]
         assert all(np.array_equal(y, ys[m]) for m in sc.METHODS), "cell order differs between methods"
-
-        
         Xu, _, _ = dataset(seeds, cond, wl_t, mmode, weighted, task, "unmix")
         routed = (models["gate"].predict(Xu) == 1) == fam_wbc
         e2e = float(np.mean(routed & (pred["unmix"] == y)))
@@ -92,11 +93,12 @@ def evaluate(task, models, wl_t, mmode, weighted, n_test, conds):
         gate_rows.append(dict(condition=name, gate_accuracy=float(np.mean(yg == pg)), acc_lo=lo, acc_hi=hi,
                               wbc_recall=float(np.mean(pg[yg == 1] == 1)) if (yg == 1).any() else np.nan,
                               rbc_recall=float(np.mean(pg[yg == 0] == 0)), n_cells=len(yg)))
-        
         d = lambda ix: macro_f1(y[ix], pred["unmix"][ix]) - macro_f1(y[ix], pred["odrgb"][ix])
         lo, hi = boot_ci(g, d)
         deltas.append(dict(condition=name, unmix_minus_odrgb=d(np.arange(len(y))), ci_lo=lo, ci_hi=hi))
     return rows, deltas, gate_rows
+
+
 
 
 def physics_checks(wl_t, mmode, weighted, cond, n=10, k=5.0):
@@ -117,6 +119,8 @@ def physics_checks(wl_t, mmode, weighted, cond, n=10, k=5.0):
     return dict(registration_rmse_px=float(np.mean(reg)),
                 concentration_pearson_r={s: float(np.nanmean(c)) for s, c in zip(sc.STAINS, corr)},
                 defect_recall=float(np.mean(rec)), defect_false_positive_rate=float(np.mean(fpr)), threshold_k=k)
+
+
 
 
 def main():
@@ -152,6 +156,8 @@ def main():
     rows, deltas, gate_rows = evaluate(a.task, models, wl_t, a.mmode, weighted, a.n_test, conds)
     phys = physics_checks(wl_t, a.mmode, weighted, base)
     cr = sc.clean_residual(tuple(base), wl_t, a.mmode, weighted)
+
+    
 
     show = ["condition", "method", "n_fields", "accuracy", "macro_f1", "f1_lo", "f1_hi", "sensitivity", "specificity", "auc", "e2e_accuracy"]
     print("\nTEST (zero-shot on every non-baseline condition)")
